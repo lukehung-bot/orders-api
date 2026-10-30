@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+.pytest_cache/
+.venv/
+# Terraform：state、變數檔、backend 設定都可能含帳號 ID 或敏感資訊，一律不進 repo
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+backend.hcl
+crash.log
+# 部署過程產生的暫存檔
+taskdef*.json
+.env

@@ -1,0 +1,6 @@
+# 複製成 terraform.tfvars 後填值（terraform.tfvars 已被 .gitignore 排除）
+alert_email        = "you@example.com"
+github_repo        = "your-github-id/orders-api"
+monthly_budget_usd = "10"
+region             = "ap-southeast-2" # 專案指定區域（AWS 設定 → 專案 → 額外資訊）
+ci_auth_mode       = "access_key"     # 一般帳號 / 付費方案改 "oidc"

@@ -1,0 +1,119 @@
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request: # PR 只跑測試與檢查，不部署
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同一分支一次只跑一個部署，避免兩個版本互相覆蓋；不取消進行中的部署（避免半套狀態）
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-southeast-2 # 專案指定區域
+  ECR_REPOSITORY: orders-api
+  ECS_CLUSTER: orders-api-cluster
+  ECS_SERVICE: orders-api-svc
+  TASK_FAMILY: orders-api
+  CONTAINER_NAME: app
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -v
+
+  infra-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v3
+      - name: terraform fmt
+        run: terraform fmt -check -recursive infra
+      - name: terraform validate
+        run: |
+          for d in infra/bootstrap infra/app; do
+            terraform -chdir=$d init -backend=false -input=false
+            terraform -chdir=$d validate
+          done
+
+  deploy:
+    needs: [test, infra-lint]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # 向 GitHub 取得 OIDC token，換取 AWS 短期憑證（不存任何長期金鑰）
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      # 兩種模式擇一，由 repo variable AWS_AUTH_MODE 決定（未設定 = access_key）
+      # oidc（一般帳號 / 付費方案，較佳）：無長期金鑰
+      - name: Configure AWS credentials (OIDC)
+        if: vars.AWS_AUTH_MODE == 'oidc'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }} # role ARN 含帳號 ID，放 secret 不進 repo
+          aws-region: ${{ env.AWS_REGION }}
+
+      # access_key（新版免費方案帳號無法建立 OIDC provider）：最小權限 CI user 的金鑰放 GitHub Secrets
+      - name: Configure AWS credentials (access key)
+        if: vars.AWS_AUTH_MODE != 'oidc'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: image
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          docker build --platform linux/amd64 --build-arg APP_VERSION=${{ github.sha }} -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition --task-definition "$TASK_FAMILY" \
+            --query taskDefinition > taskdef.json
+
+      - name: Render new task definition (swap image only)
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: taskdef.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.image.outputs.image }}
+          environment-variables: |
+            APP_VERSION=${{ github.sha }}
+
+      - name: Deploy to ECS and wait for stability
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true # 等到新版健康、舊版下線才算成功；失敗由 circuit breaker 自動回滾
+
+      - name: Summary
+        run: |
+          echo "### Deployed \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image: \`${{ steps.image.outputs.image }}\`" >> "$GITHUB_STEP_SUMMARY"

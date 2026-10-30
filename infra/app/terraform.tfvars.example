@@ -1,0 +1,5 @@
+# 複製成 terraform.tfvars 後填值（已被 .gitignore 排除）
+alert_email   = "you@example.com"
+allowed_cidrs = ["203.0.113.10/32"] # curl -s https://checkip.amazonaws.com 取得你的出口 IP
+region        = "ap-southeast-2"
+# image_tag 由 Makefile 在首次部署時以 -var 帶入（手動推上 ECR 的那個 tag）
