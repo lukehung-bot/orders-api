@@ -25,7 +25,7 @@ def summarize(rows: Iterable[Mapping[str, str]]) -> dict[str, int]:
             raise OrdersFileError(f"line {line_no}: quantity {raw_qty!r} is not an integer") from exc
         if qty < 0:
             raise OrdersFileError(f"line {line_no}: quantity must be >= 0")
-        totals[product] = qty
+        totals[product] = totals.get(product, 0) + qty
     return dict(sorted(totals.items()))
 
 
