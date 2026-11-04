@@ -1,33 +1,90 @@
 # orders-api
 
 一個內部用的小服務，從程式碼一路自動部署到 AWS（ECS Fargate），並接上 CloudWatch 監控。
-所有 AWS 資源皆以 Terraform 建立；CI/CD 使用 GitHub Actions + OIDC，repo 內不含任何 AWS 憑證或帳號 ID。
+所有 AWS 資源皆以 Terraform 建立；CI/CD 使用 GitHub Actions（憑證放 GitHub Secrets，或使用 OIDC），repo 內不含任何 AWS 憑證或帳號 ID。
 
 ## 架構
 
+分成兩張圖：**執行期**（使用者的請求怎麼走、怎麼被監控）與**交付與管理**（程式碼怎麼變成線上版本、基礎設施由誰建立）。
+
+### 1. 執行期（請求路徑與監控）
+
+三種線代表三個不同的時間點：**藍色實線 1–3** 是每次請求的路徑；**橘色虛線 A1–A4** 是部署時事先發生的（推映像 → ECS 啟動 task → 經 NAT 拉映像 → 健康檢查通過才分流量），請求進來時容器早已在執行；**灰色點線**是背景持續的 log、指標與告警。
+
 ```mermaid
 flowchart LR
-  dev[開發者 git push] --> gha[GitHub Actions<br/>test → build → deploy]
-  gha -- OIDC 短期憑證 --> iam[(IAM deploy role)]
-  gha -- push image --> ecr[(ECR)]
-  user[內部使用者<br/>限定來源 IP] --> alb
+  gha["GitHub Actions<br/>（CI/CD）"]
+  ecr[("ECR<br/>映像倉庫")]
+  user["使用者<br/>限定來源 IP"]
 
-  subgraph vpc["VPC 10.0.0.0/16"]
-    subgraph pub["Public subnets ×2 AZ"]
-      alb[ALB :80]
-      nat[NAT Gateway]
+  subgraph vpc["VPC 10.0.0.0/16（ap-southeast-2）"]
+    igw["Internet Gateway"]
+    subgraph pub["Public subnets（2a / 2b）"]
+      alb["ALB :80<br/>SG：只允許白名單 IP"]
+      nat["NAT Gateway<br/>只出不進"]
     end
-    subgraph priv["Private subnets ×2 AZ"]
-      task[ECS Fargate task<br/>FastAPI :8000]
+    subgraph priv["Private subnets（2a / 2b）"]
+      task["ECS Fargate task<br/>uvicorn + FastAPI :8000<br/>SG：只允許 ALB"]
     end
   end
 
-  alb -- /healthz 健康檢查 + 轉發 --> task
-  task -- 經 NAT 拉映像 --> ecr
-  task -- 經 NAT 送 stdout --> logs[CloudWatch Logs]
-  alb -- 5xx / HealthyHostCount --> alarm[CloudWatch Alarm]
-  alarm --> sns[SNS → Email]
+  logs["CloudWatch Logs"]
+  alarm["CloudWatch Alarm"]
+  mail["SNS → Email"]
+
+  gha -- "A1 推映像" --> ecr
+  gha -- "A2 更新 service<br/>（ECS 啟動新 task）" --> task
+  task -- "A3 拉映像" --> nat
+  nat -- "A3" --> ecr
+  alb -- "A4 健康檢查 /healthz<br/>通過才分流量" --> task
+
+  user -- "1 HTTP :80" --> igw
+  igw -- "2" --> alb
+  alb -- "3 轉發到 :8000<br/>回應原路返回" --> task
+
+  task -. "stdout log（經 NAT）" .-> logs
+  alb -. "5xx 次數 / 健康容器數" .-> alarm
+  alarm -.-> mail
+
+  linkStyle 0,1,2,3,4 stroke:#F29E38,stroke-width:2.5px,stroke-dasharray:7 4
+  linkStyle 5,6,7 stroke:#2A6FDB,stroke-width:3.5px
+  linkStyle 8,9,10 stroke:#8D99AE,stroke-width:1.5px
 ```
+
+### 2. 交付與管理（CI/CD、IaC、成本）
+
+```mermaid
+flowchart LR
+  dev[開發者] -- git push main --> gha["GitHub Actions<br/>test → lint → build → deploy"]
+  gha -- "CI 憑證<br/>（access_key 或 OIDC）" --> ci[IAM：CI 專用身分<br/>最小權限]
+  gha -- push image --> ecr[(ECR<br/>IMMUTABLE tag = git SHA)]
+  gha -- "RegisterTaskDefinition<br/>UpdateService" --> ecs[ECS service]
+
+  admin[工程師本機<br/>aws login 短期憑證] -- terraform apply --> tf[Terraform]
+  tf -- "bootstrap 層<br/>state 存本機" --> boot["S3 state bucket<br/>ECR、CI 身分、Budgets"]
+  tf -- "app 層<br/>state 存 S3" --> app["VPC、ALB、ECS、IAM roles<br/>CloudWatch、SNS"]
+  app -. state .-> s3[(S3 tfstate<br/>版本控制 + 加密 + 鎖)]
+  budget[AWS Budgets<br/>每月 10 USD] -- 50/80/100% --> mail[Email 通知]
+```
+
+### 資源對照（43 個）
+
+| 層 | 資源 | 數量 | 圖上位置 |
+|---|---|---|---|
+| bootstrap | AWS Budgets | 1 | 圖 2 |
+| bootstrap | S3 state bucket（含 versioning、加密、封鎖公開存取） | 4 | 圖 2 |
+| bootstrap | ECR repository + lifecycle policy | 2 | 圖 1、圖 2 |
+| bootstrap | CI 專用 IAM user + policy + access key（OIDC 模式則為 provider + role + policy） | 3 | 圖 2 |
+| app | VPC、Internet Gateway | 2 | 圖 1 |
+| app | Subnets（public ×2、private ×2） | 4 | 圖 1 |
+| app | NAT Gateway + EIP | 2 | 圖 1 |
+| app | Route tables ×2 + associations ×4 | 6 | 細節，未畫（public 走 IGW、private 走 NAT） |
+| app | Security groups ×2 + rules ×4 | 6 | 圖 1（標在 ALB / task 上） |
+| app | ALB、Target Group、Listener | 3 | 圖 1 |
+| app | ECS cluster、task definition、service | 3 | 圖 1、圖 2 |
+| app | IAM execution role + policy attachment、task role | 3 | 細節，未畫（execution role 給 ECS 拉映像 / 寫 log；task role 無權限） |
+| app | CloudWatch log group、alarm | 2 | 圖 1 |
+| app | SNS topic + email subscription | 2 | 圖 1 |
 
 | 放哪裡 | 資源 | 理由 |
 |---|---|---|
@@ -39,7 +96,7 @@ flowchart LR
 ```
 app/                 FastAPI 服務（summary.py 為純邏輯，方便單元測試）
 data/orders.csv      20 筆訂單範例資料
-tests/               pytest
+tests/               pytest（34 項；改壞示範見 docs/demo.md、scripts/break.sh）
 Dockerfile           multi-stage、non-root、內建 HEALTHCHECK
 infra/bootstrap/     帳號層級、生命週期較長：Budgets、tfstate bucket、ECR、GitHub OIDC role
 infra/app/           服務本身：VPC、ALB、ECS、IAM、CloudWatch Logs/Alarm、SNS
